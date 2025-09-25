@@ -69,28 +69,71 @@ void KISS_LV::PointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr &msg){
 	sig_buffer.notify_all();	
 }
 
+/**
+ * @brief KISS_LV主循环函数 - 激光雷达视觉里程计(LiDAR Visual Odometry)核心处理函数
+ * 
+ * 该函数是KISS_LV系统的核心处理循环，负责：
+ * 1. 同步激光雷达和相机数据
+ * 2. 处理传感器数据并进行位姿估计
+ * 3. 发布里程计信息和点云数据
+ * 
+ * 工作流程：
+ * - 等待传感器数据同步完成
+ * - 检查退出和重置标志
+ * - 调用Register_Color_Frame进行帧注册和位姿估计
+ * - 记录处理时间
+ */
 void KISS_LV::LVO(){
+		// 主循环：当ROS节点运行时持续执行
 		while (ros::ok()) {
+			// 创建测量组对象，用于存储同步后的激光雷达和图像数据
 			MeasureGroup meas;
+			
+			// 使用互斥锁保护缓冲区访问，确保线程安全
 			std::unique_lock<std::mutex> lock(mtx_buffer);
+			
+			// 等待条件变量信号，直到数据同步完成或收到退出信号
+			// Sync_packages函数负责同步激光雷达和相机数据
+			// b_exit标志用于优雅退出程序
 			sig_buffer.wait(lock, [this, &meas]() -> bool { return Sync_packages(meas) || b_exit; });
+			
+			// 释放互斥锁，允许其他线程访问缓冲区
 			lock.unlock();
+			
+			// 检查退出标志，如果为true则退出主循环
 			if (b_exit) 
 			{
 			    ROS_INFO("b_exit=true, exit");
 			    break;
 			}
+			
+			// 检查重置标志，通常在rosbag回放时使用
+			// 当检测到时间戳回退时会设置此标志
 			if (b_reset) 
 			{
 			    ROS_WARN("reset when rosbag play back");
 			    b_reset = false;
-			    continue;
+			    continue;  // 跳过当前帧，重新开始处理
 			}
+			
+			// 保存当前激光雷达消息的时间戳，用于后续的轨迹记录
 			save_timestamp=meas.lidar_msg->header.stamp;
+			
+			// 记录处理开始时间，用于性能分析
 			auto start = std::chrono::steady_clock::now();
+			
+			// 核心处理函数：注册彩色帧并进行位姿估计
+			// 输入：同步后的激光雷达数据和图像数据
+			// 功能：点云配准、位姿估计、地图更新
 			KISS_LV::Register_Color_Frame(meas.lidar_msg, meas.image);
+			
+			// 记录处理结束时间
 			auto end = std::chrono::steady_clock::now();
+			
+			// 计算处理耗时（毫秒）
 			std::chrono::duration<double, std::milli> elapsed = end - start;
+			
+			// 输出处理时间信息，用于性能监控和调试
 			std::cout << "Register_Color_Frame took " << elapsed.count() << " ms" << std::endl;
 	}
 }
@@ -186,53 +229,113 @@ void KISS_LV::Image_Callback(const sensor_msgs::ImageConstPtr& image_msg) {
     sig_buffer.notify_all();
 }
 
+/**
+ * @brief 注册彩色帧函数 - KISS_LV系统的核心处理函数
+ * 
+ * 该函数负责激光雷达和相机数据的融合处理，包括：
+ * 1. 多线程并行处理激光雷达和相机数据
+ * 2. 点云去畸变和特征提取
+ * 3. 位姿估计和地图更新
+ * 4. 发布各种ROS消息和保存结果
+ * 
+ * @param lidar_msg 激光雷达点云消息
+ * @param img_msg 相机图像消息
+ */
 void KISS_LV::Register_Color_Frame(const sensor_msgs::PointCloud2::ConstPtr& lidar_msg, const sensor_msgs::ImageConstPtr &img_msg) {
+	// 记录处理开始时间，用于性能分析
 	auto start = std::chrono::high_resolution_clock::now();
+	
+	// 初始化去畸变后的激光雷达扫描数据容器
 	std::vector<Eigen::Vector3d> deskew_scan;
 	deskew_scan.clear();
-	Vector6dVector color_cloud;
-	Vector6dVector map_cloud;
-	double adj_voxel_size, density;
+	
+	// 初始化彩色点云和地图点云容器
+	Vector6dVector color_cloud;    // 带颜色信息的点云 (x,y,z,r,g,b)
+	Vector6dVector map_cloud;     // 用于地图构建的点云
+	
+	// 自适应体素化参数
+	double adj_voxel_size, density;  // 调整后的体素大小和密度
+	
+	// 处理后的图像
 	cv::Mat new_image;
+	
+	// ==================== 多传感器融合处理 ====================
 	if (use_cam){
+		// 使用多线程并行处理激光雷达和相机数据以提高效率
+		// 激光雷达处理线程：去畸变、坐标变换等
 		std::thread lidarThread([&]() { processLidarData(lidar_msg, deskew_scan); });
+		
+		// 相机处理线程：图像预处理、特征提取等
 		std::thread cameraThread([&]() { processCameraData(img_msg, new_image, feather_image, intrisicMat_Resize); });
+		
+		// 等待两个线程完成
 		lidarThread.join();
 		cameraThread.join();
+		
+		// 基于特征图像生成彩色点云（用于里程计）
 		color_cloud = Get_FeatrueScan(deskew_scan, intrisicMat_Resize, extrinsicMat_RT, feather_image);
+		
+		// 基于原始图像生成地图点云（用于可视化）
 		map_cloud = Get_map_cloud(deskew_scan, intrisicMat, extrinsicMat_RT, new_image);
-
-	}
-	if (!use_cam) {
-		processLidarData(lidar_msg, deskew_scan);
-		color_cloud = Trans_Vector6(deskew_scan);
-		map_cloud = color_cloud;
 	}
 	
+	// ==================== 仅激光雷达模式 ====================
+	if (!use_cam) {
+		// 仅处理激光雷达数据
+		processLidarData(lidar_msg, deskew_scan);
+		
+		// 将3D点云转换为6D点云（添加默认颜色）
+		color_cloud = Trans_Vector6(deskew_scan);
+		map_cloud = color_cloud;  // 地图点云与彩色点云相同
+	}
+	
+	// ==================== 自适应空间模块 ====================
+	// 根据点云密度自适应调整体素大小，提高配准精度
 	const auto Input_scan = Adaptive_spatial_Module(color_cloud, adj_voxel_size, density);
+	
+	// ==================== 位姿估计 ====================
+	// 使用KISS-LV算法进行帧间配准和位姿估计
 	const auto keypoint = LVodometry_.RegisterFrame(Input_scan, adj_voxel_size, density);
 
+	// 获取当前帧的位姿（SE3变换）
 	const auto pose = LVodometry_.poses().back();
+	
+	// ==================== 性能统计 ====================
 	auto end = std::chrono::high_resolution_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+    
+    // 将处理时间写入文件，用于性能分析
     std::ofstream foutC("/home/cxl/workspace/KISS_LV/src/kiss_lv/ros/results/cost_time.txt", std::ios::app);
 	foutC.setf(std::ios::fixed, std::ios::floatfield);
 	foutC.precision(3);
 	foutC <<duration << std::endl;
 	foutC.close();
+	
+	// ==================== 数据转换和准备 ====================
+	// 获取局部地图用于可视化
 	auto save_local_map_ = LVodometry_.LocalMap();
+	
+	// 将关键点转换为PCL点云格式
 	scan_keypoint_enhance = Eigen7dToPointCloud2(keypoint);
+	
+	// 将局部地图转换为PCL点云格式
 	save_map_points = Eigen7dToPointCloud2(save_local_map_);
+	
+	// 创建RGB点云用于可视化
 	pcl::PointCloud<pcl::PointXYZRGB>::Ptr rgb_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
 	rgb_cloud = ConvertToXYZRGBPointCloud(map_cloud);
-    const Eigen::Vector3d t_current = pose.translation();
-    const Eigen::Quaterniond q_current = pose.unit_quaternion();
+	
+	// 从位姿中提取平移和旋转信息
+    const Eigen::Vector3d t_current = pose.translation();      // 平移向量
+    const Eigen::Quaterniond q_current = pose.unit_quaternion(); // 四元数旋转
 
-    //---------------------------------------Pub--------------------------------------------
+    // ==================== ROS消息发布 ====================
+    
+    // 发布TF变换消息（用于坐标变换）
     geometry_msgs::TransformStamped transform_msg;
     transform_msg.header.stamp = ros::Time::now();
-    transform_msg.header.frame_id = odom_frame_;
-    transform_msg.child_frame_id = child_frame_;
+    transform_msg.header.frame_id = odom_frame_;      // 父坐标系
+    transform_msg.child_frame_id = child_frame_;     // 子坐标系
     transform_msg.transform.rotation.x = q_current.x();
     transform_msg.transform.rotation.y = q_current.y();
     transform_msg.transform.rotation.z = q_current.z();
@@ -241,10 +344,10 @@ void KISS_LV::Register_Color_Frame(const sensor_msgs::PointCloud2::ConstPtr& lid
     transform_msg.transform.translation.y = t_current.y();
     transform_msg.transform.translation.z = t_current.z();
     tf_broadcaster_.sendTransform(transform_msg);
-	//----------------------------------------------------------
 
+    // 发布里程计消息
     nav_msgs::Odometry odom_msg;
-    odom_msg.header.stamp = save_timestamp;                                                                    
+    odom_msg.header.stamp = save_timestamp;  // 使用激光雷达时间戳
     odom_msg.header.frame_id = odom_frame_;
     odom_msg.child_frame_id = child_frame_;
     odom_msg.pose.pose.orientation.x = q_current.x();
@@ -256,7 +359,8 @@ void KISS_LV::Register_Color_Frame(const sensor_msgs::PointCloud2::ConstPtr& lid
     odom_msg.pose.pose.position.z = t_current.z();
     odom_publisher_.publish(odom_msg);
 	
-    // tum
+    // ==================== 轨迹保存 ====================
+    // 保存TUM格式的轨迹文件（用于评估）
     if (Save_path){
     	std::ofstream foutC(string(string(ROOT_DIR) + "/kiss_lv.txt"), std::ios::app);
 		foutC.setf(std::ios::fixed, std::ios::floatfield);
@@ -271,7 +375,9 @@ void KISS_LV::Register_Color_Frame(const sensor_msgs::PointCloud2::ConstPtr& lid
 		      << odom_msg.pose.pose.orientation.w << std::endl;
 		foutC.close();
     }
-    // publish trajectory msg
+    
+    // ==================== 轨迹可视化 ====================
+    // 发布轨迹消息（每两帧发布一次以降低频率）
     scan_num++;
     if (scan_num%2==0){
 		geometry_msgs::PoseStamped pose_msg;
@@ -280,34 +386,45 @@ void KISS_LV::Register_Color_Frame(const sensor_msgs::PointCloud2::ConstPtr& lid
 		path_msg_.poses.push_back(pose_msg);
 		traj_publisher_.publish(path_msg_);
 	}
+	
+	// ==================== 点云数据发布 ====================
+	// 发布RGB点云（当前帧的彩色点云）
 	sensor_msgs::PointCloud2 rgb_pointscan;
 	pcl::toROSMsg(*rgb_cloud, rgb_pointscan);
 	rgb_pointscan.header.stamp = ros::Time::now();
 	rgb_pointscan.header.frame_id = child_frame_;
 	frame_publisher_.publish(rgb_pointscan);
 	
+	// 发布关键点点云（用于调试和可视化）
 	sensor_msgs::PointCloud2 key_pointcloud;
 	pcl::toROSMsg(*scan_keypoint_enhance, key_pointcloud);
 	key_pointcloud.header.stamp = ros::Time::now();
 	key_pointcloud.header.frame_id = child_frame_;
 	kpoints_publisher_.publish(key_pointcloud);
 	
+	// 发布局部地图点云
     sensor_msgs::PointCloud2 map_msg;
 	pcl::toROSMsg(*save_map_points, map_msg);	
 	map_msg.header.stamp = ros::Time::now();
 	map_msg.header.frame_id = odom_frame_;
 	local_map_publisher_.publish(map_msg);
 	
-	
+	// ==================== 图像数据发布 ====================
+	// 发布特征图像（用于调试和可视化）
 	sensor_msgs::ImagePtr featherimage_msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", feather_image).toImageMsg();
 	featherimage_pub.publish(featherimage_msg);
+	
+	// ==================== 点云地图保存 ====================
+	// 保存完整的点云地图到PLY文件
 	if (rgb_cloud->size() > 0 && pcd_save_en)
 	{
 		pcd_index++;
 		if (pcd_index >= save_frame_num_beg){
+			// 将当前帧点云变换到全局坐标系
 			pcl::PointCloud<pcl::PointXYZRGB>::Ptr transformed_rgb_cloud(new pcl::PointCloud<pcl::PointXYZRGB>);
 			for (const auto& point : rgb_cloud->points)
 			{
+				// 使用当前位姿变换点云到全局坐标系
 				Eigen::Vector3d transformed_point = (pose * Eigen::Vector3d(point.x, point.y, point.z)).cast<double>();
 				pcl::PointXYZRGB transformed_pcl_point;
 				transformed_pcl_point.x = transformed_point.x();
@@ -318,71 +435,185 @@ void KISS_LV::Register_Color_Frame(const sensor_msgs::PointCloud2::ConstPtr& lid
 				transformed_pcl_point.b = point.b;
 				transformed_rgb_cloud->push_back(transformed_pcl_point);
 			}
+			// 将变换后的点云添加到完整地图中
 			*complete_map += *transformed_rgb_cloud;
-		string all_points_dir(string(string(ROOT_DIR) + "/scans_") + to_string(save_frame_num_end) + string(".ply"));
-		pcl::PLYWriter ply_writer;
-		if (pcd_index == save_frame_num_end)
-		{
-		    cout << "current scan saved to /PLY/:" << all_points_dir << endl;
-		    ply_writer.write(all_points_dir, *complete_map);
-		}
+			
+			// 生成保存路径
+			string all_points_dir(string(string(ROOT_DIR) + "/scans_") + to_string(save_frame_num_end) + string(".ply"));
+			pcl::PLYWriter ply_writer;
+			
+			// 当达到指定帧数时保存完整地图
+			if (pcd_index == save_frame_num_end)
+			{
+			    cout << "current scan saved to /PLY/:" << all_points_dir << endl;
+			    ply_writer.write(all_points_dir, *complete_map);
+			}
 	    }
 	}
+	
+	// ==================== 清理和重置 ====================
+	// 重置参数，为下一帧处理做准备
 	KISS_LV::resetParameters();
-
 }
 
+/**
+ * @brief 激光雷达数据处理函数 - 负责激光雷达点云的预处理和去畸变
+ * 
+ * 该函数的主要功能：
+ * 1. 将ROS点云消息转换为Eigen格式
+ * 2. 根据配置决定是否进行去畸变处理
+ * 3. 针对不同激光雷达类型进行相应的处理
+ * 
+ * 去畸变(Deskew)的作用：
+ * - 激光雷达在扫描过程中，传感器本身在运动
+ * - 不同时刻采集的点具有不同的传感器位姿
+ * - 去畸变将同一帧内的所有点投影到同一时刻的坐标系
+ * - 提高点云配准的精度和稳定性
+ * 
+ * @param lidar_msg 输入的激光雷达点云消息
+ * @param deskew_scan 输出的去畸变后的点云数据（引用传递）
+ */
 void KISS_LV::processLidarData(const sensor_msgs::PointCloud2::ConstPtr& lidar_msg, std::vector<Eigen::Vector3d> &deskew_scan) {
+	// 将ROS PointCloud2消息转换为Eigen::Vector3d格式的点云
+	// 这一步提取了点云的几何信息（x, y, z坐标）
 	const auto points = PointCloud2ToEigen(*lidar_msg);
+	
+	// ==================== 去畸变处理 ====================
+	// 检查配置文件中是否启用了去畸变功能
 	if (config_.deskew){
+		// 获取历史位姿序列，用于运动补偿
+		// poses()返回所有已估计的位姿，用于插值计算中间时刻的位姿
 		const auto pose_deskew = LVodometry_.poses();
+		
+		// 针对LIVOX激光雷达的特殊处理
+		// LIVOX激光雷达具有非重复扫描模式，需要特殊的时间戳处理
 		if (config_.type == "LIVOX"){
+			// 从LIVOX点云中提取时间戳信息
+			// LIVOX激光雷达在intensity字段中存储相对时间戳
 			const auto timestamps = Livox_time(*lidar_msg);
+			
+			// 执行去畸变处理
+			// DeSkewScan函数使用历史位姿和时间戳进行运动补偿
+			// 将所有点投影到扫描开始时刻的坐标系
 			deskew_scan = DeSkewScan(points, timestamps, pose_deskew);
 		}
+		// 注意：这里只处理了LIVOX类型，其他激光雷达类型（如Velodyne）可能需要不同的处理方式
 	}
+	
+	// ==================== 无去畸变模式 ====================
+	// 如果配置中禁用了去畸变，直接使用原始点云数据
 	if (!config_.deskew){
+		// 直接将原始点云赋值给输出，不进行任何运动补偿
 		deskew_scan = points;
 	}
+	
+	// 输出说明：
+	// - deskew_scan现在包含了处理后的点云数据
+	// - 如果启用了去畸变，点云已经过运动补偿
+	// - 如果未启用去畸变，点云保持原始状态
+	// - 后续的配准算法将使用这些处理后的点云进行位姿估计
 }
 
+/**
+ * @brief 相机数据处理函数 - 负责相机图像的预处理、增强和特征提取
+ * 
+ * 该函数的主要功能：
+ * 1. 图像去畸变和校正
+ * 2. 图像增强和预处理
+ * 3. 白平衡调整
+ * 4. 特征提取（线条和关键点）
+ * 
+ * 处理流程：
+ * ROS图像消息 → OpenCV格式 → 去畸变 → 图像增强 → 缩放 → 白平衡 → 灰度化 → 特征提取
+ * 
+ * @param msg 输入的ROS图像消息
+ * @param new_image 输出的增强后图像（引用传递）
+ * @param feather_image 输出的特征图像，包含线条和关键点（引用传递）
+ * @param intrisicMat_Resize 缩放后的内参矩阵（用于后续处理）
+ */
 void KISS_LV::processCameraData(const sensor_msgs::ImageConstPtr &msg,
                                  cv::Mat &new_image,
                                  cv::Mat &feather_image,
                                  cv::Mat intrisicMat_Resize)
 {
     try {
-        static cv::Mat map1, map2;
-        static bool map_initialized = false;
+        // ==================== 静态变量初始化 ====================
+        // 去畸变映射表，用于快速去畸变处理
+        // 使用static确保只初始化一次，提高效率
+        static cv::Mat map1, map2;                    // 去畸变映射表
+        static bool map_initialized = false;         // 映射表初始化标志
+        
+        // 白平衡处理器，用于自动调整图像色彩平衡
         static cv::Ptr<cv::xphoto::SimpleWB> wb = cv::xphoto::createSimpleWB();
-        wb->setInputMin(0.0f);
-        wb->setInputMax(255.0f);
+        wb->setInputMin(0.0f);    // 设置输入最小值
+        wb->setInputMax(255.0f);  // 设置输入最大值
 
+        // ==================== 图像格式转换 ====================
+        // 将ROS图像消息转换为OpenCV Mat格式
+        // cv_bridge是ROS和OpenCV之间的桥梁
         cv_bridge::CvImagePtr cv_ptr = cv_bridge::toCvCopy(msg, sensor_msgs::image_encodings::BGR8);
-        const cv::Mat& raw_img = cv_ptr->image;
+        const cv::Mat& raw_img = cv_ptr->image;  // 获取原始图像
 
+        // ==================== 去畸变映射表初始化 ====================
+        // 只在第一次调用时初始化映射表，避免重复计算
         if (!map_initialized) {
+            // 初始化去畸变和校正映射表
+            // un_intrisicMat: 去畸变后的内参矩阵
+            // distCoeffs: 畸变系数
+            // raw_img.size(): 图像尺寸
+            // CV_16SC2: 映射表数据类型
             cv::initUndistortRectifyMap(un_intrisicMat, distCoeffs, cv::Mat(),
                                         un_intrisicMat, raw_img.size(), CV_16SC2, map1, map2);
-            map_initialized = true;
+            map_initialized = true;  // 标记已初始化
         }
 
+        // ==================== 图像去畸变 ====================
+        // 使用预计算的映射表进行快速去畸变
         cv::Mat undistorted;
         cv::remap(raw_img, undistorted, map1, map2, cv::INTER_LINEAR);
+        
+        // ==================== 图像增强 ====================
+        // 使用ALTM_retinex算法进行图像增强
+        // Retinex算法可以改善光照不均和对比度问题
         new_image = ALTM_retinex(undistorted);
 
+        // ==================== 图像缩放 ====================
+        // 将图像缩放到较小尺寸以提高处理速度
         cv::Mat small_img;
         cv::resize(new_image, small_img, cv::Size(W / resize, H / resize));
+        
+        // ==================== 白平衡调整 ====================
+        // 自动调整图像的白平衡，改善色彩表现
         wb->balanceWhite(small_img, small_img);
 
+        // ==================== 灰度化和滤波 ====================
+        // 转换为灰度图像用于特征提取
         cv::Mat gray;
         cv::cvtColor(small_img, gray, cv::COLOR_BGR2GRAY);
+        
+        // 中值滤波去除噪声，保持边缘信息
         cv::medianBlur(gray, gray, 3);
+        
+        // ==================== 特征提取 ====================
+        // 从灰度图像中提取线条特征和关键点特征
+        // 参数说明：
+        // - line_th: 线条检测阈值
+        // - line_len: 最小线条长度
+        // - line_wide: 线条绘制宽度
+        // - point_th: 关键点数量阈值
+        // - radius_size: 关键点绘制半径
         feather_image = get_image_keypoints(gray, line_th, line_len, line_wide, point_th, radius_size);
     }
     catch (cv_bridge::Exception &e) {
+        // ==================== 异常处理 ====================
+        // 如果图像格式转换失败，输出错误信息
         ROS_ERROR("Could not convert from '%s' to 'bgr8'.", msg->encoding.c_str());
     }
+    
+    // 输出说明：
+    // - new_image: 经过去畸变、增强、缩放、白平衡处理的彩色图像
+    // - feather_image: 包含线条和关键点特征的可视化图像
+    // - 这些图像将用于后续的点云着色和特征匹配
 }
 
 
@@ -512,112 +743,241 @@ std::vector<Eigen::Vector3d> CorrectKITTIScan(const std::vector<Eigen::Vector3d>
     });
     return corrected_frame;
 }
+/**
+ * @brief 特征扫描函数 - 将激光雷达点云投影到特征图像上并根据特征信息着色
+ * 
+ * 该函数的主要功能：
+ * 1. 将3D激光雷达点云投影到2D特征图像上
+ * 2. 根据特征图像中的特征信息为点云着色
+ * 3. 生成带颜色信息的6D点云(x,y,z,r,g,b)
+ * 
+ * 投影过程：
+ * 激光雷达坐标系 → 相机坐标系 → 图像坐标系
+ * 
+ * 着色策略：
+ * - 默认颜色：绿色(55,100,55)
+ * - 特征颜色：根据特征图像中的线条和关键点信息着色
+ * - 特征检测：通过特定的BGR颜色组合识别特征区域
+ * 
+ * @param laser_data 输入的激光雷达3D点云数据
+ * @param intrisicMat 相机内参矩阵(3x3)
+ * @param extrinsicMat_RT 激光雷达到相机的外参变换矩阵(4x4)
+ * @param feather_image 特征图像，包含线条和关键点的可视化信息
+ * @return Vector6dVector 带颜色信息的6D点云(x,y,z,r,g,b)
+ */
 Vector6dVector Get_FeatrueScan(const std::vector<Eigen::Vector3d>& laser_data,
                                const cv::Mat& intrisicMat,
                                const cv::Mat& extrinsicMat_RT,
                                const cv::Mat& feather_image) {
-    int H = feather_image.rows;
-    int W = feather_image.cols;
+    // ==================== 图像尺寸获取 ====================
+    int H = feather_image.rows;  // 特征图像高度
+    int W = feather_image.cols;  // 特征图像宽度
+    
+    // 存储最终输出的6D点云(x,y,z,r,g,b)
     Vector6dVector pl_points;
 
-    Eigen::Matrix<double, 3, 3> intrinsic;
-    Eigen::Matrix<double, 4, 4> extrinsic;
-    cv::cv2eigen(intrisicMat, intrinsic);
+    // ==================== 矩阵格式转换 ====================
+    // 将OpenCV Mat格式转换为Eigen Matrix格式，便于数学运算
+    Eigen::Matrix<double, 3, 3> intrinsic;   // 相机内参矩阵
+    Eigen::Matrix<double, 4, 4> extrinsic;   // 激光雷达到相机的变换矩阵
+    cv::cv2eigen(intrisicMat, intrinsic);    // OpenCV → Eigen转换
     cv::cv2eigen(extrinsicMat_RT, extrinsic);
 
+    // ==================== 并行点云处理 ====================
+    // 使用OpenMP并行处理点云，提高处理速度
     #pragma omp parallel
     {
+        // 每个线程维护自己的局部点云容器，避免数据竞争
         Vector6dVector local_points;
 
+        // 并行遍历所有激光雷达点
         #pragma omp for nowait
         for (int i = 0; i < laser_data.size(); ++i) {
-            const auto& pt = laser_data[i];
+            const auto& pt = laser_data[i];  // 获取当前3D点
 
-
+            // ==================== 距离过滤 ====================
+            // 过滤掉距离过近的点（可能是噪声或无效数据）
             if (pt[0] <= 0)
                 continue;
 
+            // ==================== 坐标变换 ====================
+            // 将激光雷达坐标系下的点转换为齐次坐标
             Eigen::Vector4d pointLidar(pt[0], pt[1], pt[2], 1.0);
+            
+            // 使用外参矩阵将点从激光雷达坐标系变换到相机坐标系
             Eigen::Vector4d tempPoint = extrinsic * pointLidar;
 
+            // ==================== 深度过滤 ====================
+            // 过滤掉相机坐标系下深度为负的点（在相机后方）
             if (tempPoint[2] <= 0) continue;
 
+            // ==================== 投影到图像平面 ====================
+            // 使用相机内参将3D点投影到2D图像平面
+            // 透视投影公式：u = fx * X/Z + cx, v = fy * Y/Z + cy
             Eigen::Vector3d imgPoint = intrinsic * tempPoint.head<3>() / tempPoint[2];
 
-            int u = static_cast<int>(imgPoint[0]);
-            int v = static_cast<int>(imgPoint[1]);
+            // 将浮点坐标转换为整数像素坐标
+            int u = static_cast<int>(imgPoint[0]);  // 图像x坐标
+            int v = static_cast<int>(imgPoint[1]);  // 图像y坐标
+            
+            // ==================== 边界检查和着色 ====================
+            // 检查投影点是否在图像边界内
             if (u >= 0 && u < W && v >= 0 && v < H) {
+                // 设置默认颜色：绿色(55,100,55)
                 Eigen::Vector3d color(55, 100, 55);
 
+                // ==================== 特征检测和着色 ====================
+                // 获取特征图像中对应像素的BGR值
                 const uchar* pixel = feather_image.ptr<uchar>(v) + 3 * u;
-                uchar b = pixel[0];
-                uchar g = pixel[1];
-                uchar r = pixel[2];
+                uchar b = pixel[0];  // 蓝色分量
+                uchar g = pixel[1];  // 绿色分量
+                uchar r = pixel[2];   // 红色分量
 
+                // 检测特征区域：通过特定的BGR颜色组合识别线条和关键点
+                // 条件1：(b==255 && r==55) - 检测到某种特征
+                // 条件2：(b==55 && r==255) - 检测到另一种特征
                 if ((b == 255 && r == 55) || (b == 55 && r == 255)) {
-                    color[0] = static_cast<double>(r);
-                    color[1] = 55.0;
-                    color[2] = static_cast<double>(b);
+                    // 根据特征类型设置特殊颜色
+                    color[0] = static_cast<double>(r);  // 红色分量
+                    color[1] = 55.0;                     // 绿色分量固定为55
+                    color[2] = static_cast<double>(b);  // 蓝色分量
                 }
 
+                // ==================== 构建6D点云 ====================
+                // 将3D坐标和颜色信息组合成6D点
                 Vector6d point;
-                point << pt, color;
+                point << pt, color;  // 前3维是坐标(x,y,z)，后3维是颜色(r,g,b)
+                
+                // 将处理后的点添加到局部容器
                 local_points.push_back(point);
             }
         }
+        
+        // ==================== 线程同步 ====================
+        // 使用critical section将各线程的局部结果合并到全局容器
         #pragma omp critical
         pl_points.insert(pl_points.end(), local_points.begin(), local_points.end());
     }
 
+    // ==================== 返回结果 ====================
+    // 返回包含所有有效投影点的6D彩色点云
+    // 该点云将用于：
+    // 1. 激光雷达视觉里程计的配准
+    // 2. 特征增强的点云配准
+    // 3. 多传感器融合的位姿估计
     return pl_points;
 }
+/**
+ * @brief 地图点云生成函数 - 将激光雷达点云投影到原始图像上并根据真实颜色着色
+ * 
+ * 该函数的主要功能：
+ * 1. 将3D激光雷达点云投影到2D原始图像上
+ * 2. 根据图像的真实RGB颜色为点云着色
+ * 3. 生成用于地图构建的6D彩色点云(x,y,z,r,g,b)
+ * 
+ * 与Get_FeatrueScan的区别：
+ * - Get_FeatrueScan：使用特征图像，根据特征信息着色（用于里程计）
+ * - Get_map_cloud：使用原始图像，根据真实颜色着色（用于地图构建）
+ * 
+ * 投影过程：
+ * 激光雷达坐标系 → 相机坐标系 → 图像坐标系
+ * 
+ * 着色策略：
+ * - 直接使用原始图像的RGB值
+ * - 保持图像的真实色彩信息
+ * - 用于生成高质量的可视化地图
+ * 
+ * @param laser_data 输入的激光雷达3D点云数据
+ * @param intrisicMat 相机内参矩阵(3x3)
+ * @param extrinsicMat_RT 激光雷达到相机的外参变换矩阵(4x4)
+ * @param new_image 原始彩色图像，包含真实的RGB颜色信息
+ * @return Vector6dVector 带真实颜色信息的6D点云(x,y,z,r,g,b)
+ */
 Vector6dVector Get_map_cloud(const std::vector<Eigen::Vector3d>& laser_data,
                              const cv::Mat& intrisicMat,
                              const cv::Mat& extrinsicMat_RT,
                              const cv::Mat& new_image) {
-    int H = new_image.rows;
-    int W = new_image.cols;
+    // ==================== 图像尺寸获取 ====================
+    int H = new_image.rows;  // 原始图像高度
+    int W = new_image.cols;  // 原始图像宽度
+    
+    // 存储最终输出的6D彩色点云(x,y,z,r,g,b)
     Vector6dVector rgb_points;
 
-    Eigen::Matrix3d intrinsic;
-    Eigen::Matrix4d extrinsic;
-    cv::cv2eigen(intrisicMat, intrinsic);
+    // ==================== 矩阵格式转换 ====================
+    // 将OpenCV Mat格式转换为Eigen Matrix格式，便于数学运算
+    Eigen::Matrix3d intrinsic;   // 相机内参矩阵(3x3)
+    Eigen::Matrix4d extrinsic;   // 激光雷达到相机的变换矩阵(4x4)
+    cv::cv2eigen(intrisicMat, intrinsic);    // OpenCV → Eigen转换
     cv::cv2eigen(extrinsicMat_RT, extrinsic);
 
+    // ==================== 并行点云处理 ====================
+    // 使用OpenMP并行处理点云，提高处理速度
     #pragma omp parallel
     {
+        // 每个线程维护自己的局部点云容器，避免数据竞争
         Vector6dVector local_points;
 
+        // 并行遍历所有激光雷达点
         #pragma omp for nowait
         for (int i = 0; i < laser_data.size(); ++i) {
-            const auto& pt = laser_data[i];
+            const auto& pt = laser_data[i];  // 获取当前3D点
+            
+            // ==================== 坐标变换 ====================
+            // 将激光雷达坐标系下的点转换为齐次坐标
             Eigen::Vector4d pt_lidar(pt.x(), pt.y(), pt.z(), 1.0);
-
+            
+            // 使用外参矩阵将点从激光雷达坐标系变换到相机坐标系
             Eigen::Vector4d pt_cam = extrinsic * pt_lidar;
+            
+            // ==================== 深度过滤 ====================
+            // 过滤掉相机坐标系下深度为负的点（在相机后方）
             if (pt_cam[2] <= 0) continue;
 
+            // ==================== 投影到图像平面 ====================
+            // 使用相机内参将3D点投影到2D图像平面
+            // 透视投影公式：u = fx * X/Z + cx, v = fy * Y/Z + cy
             Eigen::Vector3d pt_img = intrinsic * pt_cam.head<3>() / pt_cam[2];
 
-            int u = static_cast<int>(pt_img[0]);
-            int v = static_cast<int>(pt_img[1]);
+            // 将浮点坐标转换为整数像素坐标
+            int u = static_cast<int>(pt_img[0]);  // 图像x坐标
+            int v = static_cast<int>(pt_img[1]);  // 图像y坐标
 
+            // ==================== 边界检查和着色 ====================
+            // 检查投影点是否在图像边界内
             if (u >= 0 && u < W && v >= 0 && v < H) {
+                // ==================== 真实颜色提取 ====================
+                // 获取原始图像中对应像素的真实RGB值
                 const uchar* pixel = new_image.ptr<uchar>(v) + 3 * u;
-                uchar b = pixel[0];
-                uchar g = pixel[1];
-                uchar r = pixel[2];
+                uchar b = pixel[0];  // 蓝色分量
+                uchar g = pixel[1];  // 绿色分量
+                uchar r = pixel[2];   // 红色分量
 
+                // ==================== 构建6D彩色点云 ====================
+                // 将3D坐标和真实RGB颜色信息组合成6D点
                 Vector6d rgb_point;
-                rgb_point << pt.x(), pt.y(), pt.z(),
-                             static_cast<double>(r),
-                             static_cast<double>(g),
-                             static_cast<double>(b);
+                rgb_point << pt.x(), pt.y(), pt.z(),           // 前3维：3D坐标(x,y,z)
+                             static_cast<double>(r),            // 第4维：红色分量
+                             static_cast<double>(g),            // 第5维：绿色分量
+                             static_cast<double>(b);           // 第6维：蓝色分量
+                
+                // 将处理后的彩色点添加到局部容器
                 local_points.push_back(rgb_point);
             }
         }
+        
+        // ==================== 线程同步 ====================
+        // 使用critical section将各线程的局部结果合并到全局容器
         #pragma omp critical
         rgb_points.insert(rgb_points.end(), local_points.begin(), local_points.end());
     }
+    
+    // ==================== 返回结果 ====================
+    // 返回包含所有有效投影点的6D彩色点云
+    // 该点云将用于：
+    // 1. 高质量地图构建和可视化
+    // 2. 真实色彩的点云地图展示
+    // 3. 后续的地图保存和导出
     return rgb_points;
 }
 Vector6dVector Trans_Vector6(const std::vector<Eigen::Vector3d>& laser_data){
@@ -783,36 +1143,102 @@ std::vector<cv::KeyPoint> trackORBFeatures(const cv::Mat gray_image, int point_t
 
     return keypoints;
 }
+/**
+ * @brief 图像关键点提取和可视化函数 - 从灰度图像中提取线条和关键点特征并进行可视化
+ * 
+ * 该函数的主要功能：
+ * 1. 并行提取线条特征和关键点特征
+ * 2. 将特征绘制到彩色图像上进行可视化
+ * 3. 返回包含特征信息的图像
+ * 
+ * 特征类型：
+ * - 线条特征：使用LSD(Line Segment Detector)算法检测直线段
+ * - 关键点特征：使用ORB算法检测角点和特征点
+ * 
+ * 可视化效果：
+ * - 线条：红色线条，可调节粗细
+ * - 关键点：红色矩形框，可调节大小
+ * 
+ * @param gray_image 输入的灰度图像
+ * @param line_th 线条检测阈值（未直接使用，在detectLineFeatures内部使用）
+ * @param line_len 最小线条长度阈值
+ * @param line_wide 线条绘制宽度
+ * @param point_th 关键点数量阈值
+ * @param radius_size 关键点绘制半径（转换为矩形边长）
+ * @return cv::Mat 包含特征可视化的彩色图像
+ */
 cv::Mat get_image_keypoints(cv::Mat gray_image, int line_th, int line_len, int line_wide, int point_th, int radius_size){
+	// ==================== 变量初始化 ====================
+	// 存储检测到的线条特征，每个线条用4个浮点数表示(x1,y1,x2,y2)
 	std::vector<cv::Vec4f> lines_ls;
+	
+	// 存储检测到的关键点特征，包含位置、尺度、方向等信息
 	std::vector<cv::KeyPoint> keypoints;
+	
+	// 将灰度图像转换为BGR彩色图像，用于特征可视化
+	// feather_image是全局变量，用于存储最终的可视化结果
 	cv::cvtColor(gray_image, feather_image, cv::COLOR_GRAY2BGR);
+	
+	// ==================== 并行特征提取 ====================
+	// 使用Intel TBB并行库同时进行线条和关键点检测
+	// 将任务分为2个并行块：线条检测和关键点检测
 	tbb::parallel_for(tbb::blocked_range<int>(0, 2), [&](const tbb::blocked_range<int>& r) {
+	    // 第一个并行任务：线条特征检测
 	    if (r.begin() == 0) {
+	        // 使用LSD算法检测直线段特征
+	        // detectLineFeatures函数内部会使用line_th等参数
 	        lines_ls = detectLineFeatures(gray_image, line_len);
 	    } 
 	    
+	    // 第二个并行任务：关键点特征检测
 	    else {
+	        // 使用ORB算法检测角点和特征点
+	        // trackORBFeatures函数会限制关键点数量为point_th
 	        keypoints = trackORBFeatures(gray_image, point_th);
 	    }
 	});
 
-	cv::Scalar lineColor(55, 55, 255);
-	cv::Scalar keypointColor(255, 55, 55); 
-	// draw line
-	int lineThickness = line_wide; 
+	// ==================== 特征可视化 ====================
+	// 定义线条和关键点的绘制颜色
+	cv::Scalar lineColor(55, 55, 255);      // 红色线条 (BGR格式)
+	cv::Scalar keypointColor(255, 55, 55);   // 红色关键点 (BGR格式)
+	
+	// ==================== 绘制线条特征 ====================
+	int lineThickness = line_wide;  // 线条粗细
+	
+	// 遍历所有检测到的线条并绘制
 	for (const auto& line : lines_ls) {
-	    cv::Point pt1(line[0], line[1]);
-	    cv::Point pt2(line[2], line[3]);
-	    cv::line(feather_image, pt1, pt2, lineColor,lineThickness);
+	    // 提取线条的起点和终点坐标
+	    cv::Point pt1(line[0], line[1]);  // 起点 (x1, y1)
+	    cv::Point pt2(line[2], line[3]);  // 终点 (x2, y2)
+	    
+	    // 在图像上绘制线条
+	    cv::line(feather_image, pt1, pt2, lineColor, lineThickness);
 	}
+	
+	// ==================== 绘制关键点特征 ====================
+	// 遍历所有检测到的关键点并绘制
 	for (const auto& keypoint : keypoints) {
+		// 获取关键点的中心坐标
 		cv::Point2f point = keypoint.pt;
+		
+		// 计算矩形框的边长（关键点用矩形框表示）
 		int side_length = radius_size * 2;
+		
+		// 计算矩形框的左上角和右下角坐标
 		cv::Point2f upper_left(point.x - side_length / 2, point.y - side_length / 2);
 		cv::Point2f bottom_right(point.x + side_length / 2, point.y + side_length / 2);
+		
+		// 在图像上绘制填充的矩形框表示关键点
 		cv::rectangle(feather_image, upper_left, bottom_right, keypointColor, cv::FILLED);
 	}
+	
+	// ==================== 返回结果 ====================
+	// 返回包含所有特征可视化的彩色图像
+	// 该图像将用于：
+	// 1. 调试和可视化特征检测效果
+	// 2. 点云着色时的特征匹配
+	// 3. 算法性能评估
 	return feather_image;
 }
 pcl::PointCloud<pcl::PointXYZRGB>::Ptr ConvertToXYZRGBPointCloud(const Vector6dVector& map_cloud) {
