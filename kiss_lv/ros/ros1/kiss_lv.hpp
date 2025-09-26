@@ -39,7 +39,7 @@
 //file
 #include "kiss_lv/pipeline/KissLV.hpp"
 #include "kiss_lv/core/VoxelHashMap_Color.hpp"
-#include <livox_ros_driver/CustomMsg.h>
+#include <livox_ros_driver2/CustomMsg.h>
 #include <tbb/parallel_for.h>
 #include <lsd_tool.hpp>
 #include <common_lib.h>
@@ -176,7 +176,7 @@ public:
     cv::Mat intrisicMat_Resize = cv::Mat(3, 4, cv::DataType<double>::type);
    
 
-   	void livox_handler(const livox_ros_driver::CustomMsg::ConstPtr& livox_msg_in);
+   	void livox_handler(const livox_ros_driver2::CustomMsg::ConstPtr& livox_msg_in);
    	void ruby128_handler(const sensor_msgs::PointCloud::ConstPtr& cloud_msg);
    	void PointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr &msg);
     void Image_Callback(const sensor_msgs::ImageConstPtr &msg);

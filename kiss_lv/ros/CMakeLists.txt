@@ -48,7 +48,7 @@ if("$ENV{ROS_VERSION}" STREQUAL "1")
   find_package(
     catkin REQUIRED
     COMPONENTS geometry_msgs
-    		   livox_ros_driver
+    		   livox_ros_driver2
     		   cv_bridge
                nav_msgs
                sensor_msgs

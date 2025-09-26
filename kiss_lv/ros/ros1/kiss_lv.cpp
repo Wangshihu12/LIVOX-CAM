@@ -31,7 +31,7 @@ std::vector<double> GetVelodyneTimestamps(const std::vector<Eigen::Vector3d> &po
 std::vector<double> GetTimestamps(const sensor_msgs::PointCloud2 &msg);
 cv::Mat feather_image;
 //-------------------------------------------------------------------------------------------------------------------------------------------
-void KISS_LV::livox_handler(const livox_ros_driver::CustomMsg::ConstPtr& livox_msg_in) {
+void KISS_LV::livox_handler(const livox_ros_driver2::CustomMsg::ConstPtr& livox_msg_in) {
 	PointCloudXYZI::Ptr pcl_data(new PointCloudXYZI);
 	auto time_end = livox_msg_in->points.back().offset_time;
     for (unsigned int i = 0; i < livox_msg_in->point_num; ++i) {
